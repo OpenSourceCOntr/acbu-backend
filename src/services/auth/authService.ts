@@ -946,6 +946,9 @@ export async function issueRefreshToken(
  * Validate a refresh token and rotate it (token-family rotation).
  * When a refresh token is used, the entire family should be invalidated
  * to detect token theft. A new token in a new family is issued.
+ *
+ * Uses a transaction with row-level locking to prevent concurrent refresh
+ * requests from issuing duplicate tokens (#987).
  */
 export async function refreshAccessToken(
   params: RefreshAccessTokenParams,
@@ -955,85 +958,104 @@ export async function refreshAccessToken(
   const tokenHash = await hashRefreshToken(refresh_token);
   const now = new Date();
 
-  const existingToken = await prisma.refreshToken.findFirst({
-    where: {
-      tokenHash,
-      revokedAt: null,
-      expiresAt: { gt: now },
-    },
-    include: {
-      user: {
-        select: {
-          id: true,
-          actorType: true,
-          organizationId: true,
-        },
+  // Use a transaction with row-level locking to prevent concurrent refreshes
+  const result = await prisma.$transaction(async (tx) => {
+    // Find the token with FOR UPDATE lock to prevent concurrent access
+    const existingToken = await tx.$queryRaw<
+      Array<{
+        id: string;
+        tokenFamilyId: string;
+        userId: string;
+        user_actorType: string;
+        user_organizationId: string | null;
+      }>
+    >`
+      SELECT
+        rt.id,
+        rt.token_family_id as "tokenFamilyId",
+        rt.user_id as "userId",
+        u.actor_type as "user_actorType",
+        u.organization_id as "user_organizationId"
+      FROM refresh_tokens rt
+      JOIN users u ON u.id = rt.user_id
+      WHERE rt.token_hash = ${tokenHash}
+        AND rt.revoked_at IS NULL
+        AND rt.expires_at > ${now}
+      FOR UPDATE OF rt
+    `;
+
+    if (existingToken.length === 0) {
+      throw new InvalidOrExpiredRefreshTokenError();
+    }
+
+    const token = existingToken[0];
+
+    // Token-family rotation: invalidate all tokens in the same family
+    await tx.refreshToken.updateMany({
+      where: {
+        tokenFamilyId: token.tokenFamilyId,
+        revokedAt: null,
       },
-    },
-  });
+      data: {
+        revokedAt: now,
+        replacedByToken: tokenHash,
+      },
+    });
 
-  if (!existingToken) {
-    throw new InvalidOrExpiredRefreshTokenError();
-  }
+    // Issue a new API key
+    const api_key = await generateApiKey(token.userId, [], { keyType: "USER_KEY" });
 
-  const { user, tokenFamilyId } = existingToken;
+    // Issue a new refresh token in a NEW family
+    const newToken = generateSecureRefreshToken();
+    const newTokenHash = await hashRefreshToken(newToken);
+    const newTokenFamilyId = randomUUID();
+    const newExpiresAt = new Date(Date.now() + REFRESH_TOKEN_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
 
-  // Token-family rotation: invalidate all tokens in the same family
-  // This detects token theft - if an attacker tries to use an old token,
-  // the family will already be revoked
-  await prisma.refreshToken.updateMany({
-    where: {
-      tokenFamilyId,
-      revokedAt: null,
-    },
-    data: {
-      revokedAt: now,
-      replacedByToken: tokenHash,
-    },
-  });
+    await tx.refreshToken.create({
+      data: {
+        userId: token.userId,
+        tokenFamilyId: newTokenFamilyId,
+        tokenHash: newTokenHash,
+        expiresAt: newExpiresAt,
+      },
+    });
 
-  // Issue a new API key
-  const api_key = await generateApiKey(user.id, [], { keyType: "USER_KEY" });
-
-  // Issue a new refresh token in a NEW family
-  const newToken = generateSecureRefreshToken();
-  const newTokenHash = await hashRefreshToken(newToken);
-  const newTokenFamilyId = randomUUID();
-  const newExpiresAt = new Date(Date.now() + REFRESH_TOKEN_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
-
-  await prisma.refreshToken.create({
-    data: {
-      userId: user.id,
-      tokenFamilyId: newTokenFamilyId,
-      tokenHash: newTokenHash,
-      expiresAt: newExpiresAt,
-    },
+    return {
+      api_key,
+      refresh_token: newToken,
+      user_id: token.userId,
+      user_actorType: token.user_actorType,
+      user_organizationId: token.user_organizationId,
+      oldTokenFamilyId: token.tokenFamilyId,
+      newTokenFamilyId,
+      newExpiresAt,
+    };
   });
 
   await logAudit({
     eventType: "auth",
     entityType: "refresh_token",
-    entityId: existingToken.id,
+    entityId: result.user_id,
     action: "refresh_token_rotated",
-    performedBy: user.id,
-    actorType: user.actorType,
+    performedBy: result.user_id,
+    actorType: result.user_actorType as any,
     keyType: "USER_KEY",
-    organizationId: user.organizationId ?? undefined,
-    oldValue: { oldTokenFamilyId: tokenFamilyId },
-    newValue: { newTokenFamilyId },
+    organizationId: result.user_organizationId ?? undefined,
+    oldValue: { oldTokenFamilyId: result.oldTokenFamilyId },
+    newValue: { newTokenFamilyId: result.newTokenFamilyId },
   });
 
   logger.info("Refresh token rotated", {
-    userId: user.id,
-    oldTokenFamilyId: tokenFamilyId,
-    newTokenFamilyId,
+    userId: result.user_id,
+    oldTokenFamilyId: result.oldTokenFamilyId,
+    newTokenFamilyId: result.newTokenFamilyId,
   });
 
   return {
-    api_key,
-    refresh_token: newToken,
-    user_id: user.id,
-    expires_at: newExpiresAt.toISOString(),
+    api_key: result.api_key,
+    refresh_token: result.refresh_token,
+    user_id: result.user_id,
+    expires_at: result.newExpiresAt.toISOString(),
   };
 }
 
