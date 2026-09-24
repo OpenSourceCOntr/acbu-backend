@@ -12,10 +12,20 @@
  */
 
 import { Request, Response, NextFunction } from "express";
+import { Prisma } from "@prisma/client";
 import { weightDriftAuditService } from "../services/reserve/WeightDriftAuditService";
 import { logger } from "../config/logger";
 import { AppError } from "../middleware/errorHandler";
 import { ErrorCodes } from "../types/errorCodes";
+
+interface AdminRequest extends Request {
+  adminId?: string;
+}
+
+interface PrismaError {
+  code?: string;
+  message?: string;
+}
 
 /**
  * @swagger
@@ -104,7 +114,8 @@ export const getWeightDriftAudit = async (
 
     res.json(audit);
   } catch (e) {
-    if ((e as any).code === "P2025") {
+    const error = e as PrismaError;
+    if (error.code === "P2025") {
       throw new AppError("Audit not found", 404, ErrorCodes.NOT_FOUND);
     } else {
       logger.error("Failed to get weight drift audit", { error: e });
@@ -126,13 +137,13 @@ export const getWeightDriftAudit = async (
  *         description: Audit created with pending status
  */
 export const createWeightDriftAudit = async (
-  req: Request,
+  req: AdminRequest,
   res: Response,
   next: NextFunction,
 ): Promise<void> => {
   try {
     // Extract admin ID from auth context (set by middleware)
-    const adminId = (req as any).adminId || "system";
+    const adminId = req.adminId || "system";
 
     // Calculate drift report
     const report = await weightDriftAuditService.calculateDriftReport();
@@ -184,7 +195,7 @@ export const createWeightDriftAudit = async (
  *         description: Audit not found
  */
 export const approveWeightDriftAudit = async (
-  req: Request,
+  req: AdminRequest,
   res: Response,
   next: NextFunction,
 ): Promise<void> => {
@@ -192,7 +203,7 @@ export const approveWeightDriftAudit = async (
     const { id } = req.params;
     const { approvalNotes } = req.body;
 
-    const adminId = (req as any).adminId || "system";
+    const adminId = req.adminId || "system";
 
     const audit = await weightDriftAuditService.approveAudit(
       id,
@@ -207,7 +218,7 @@ export const approveWeightDriftAudit = async (
 
     res.json(audit);
   } catch (e) {
-    const error = e as any;
+    const error = e as PrismaError;
     if (error.code === "P2025") {
       throw new AppError("Audit not found", 404, ErrorCodes.NOT_FOUND);
     } else if (error.message?.includes("Cannot approve audit")) {
@@ -252,7 +263,7 @@ export const approveWeightDriftAudit = async (
  *         description: Audit not found
  */
 export const rejectWeightDriftAudit = async (
-  req: Request,
+  req: AdminRequest,
   res: Response,
   next: NextFunction,
 ): Promise<void> => {
@@ -268,7 +279,7 @@ export const rejectWeightDriftAudit = async (
       );
     }
 
-    const adminId = (req as any).adminId || "system";
+    const adminId = req.adminId || "system";
 
     const audit = await weightDriftAuditService.rejectAudit(
       id,
@@ -283,7 +294,7 @@ export const rejectWeightDriftAudit = async (
 
     res.json(audit);
   } catch (e) {
-    const error = e as any;
+    const error = e as PrismaError;
     if (error.code === "P2025") {
       throw new AppError("Audit not found", 404, ErrorCodes.NOT_FOUND);
     } else if (error.message?.includes("Cannot reject audit")) {
