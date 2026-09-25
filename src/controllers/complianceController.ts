@@ -29,11 +29,7 @@ export async function exportData(
     }
 
     // Omit sensitive backend secrets like encrypted keys and passcode hashes before export
-    const safeUser = { ...user };
-    delete (safeUser as any).passcodeHash;
-    delete (safeUser as any).encryptedStellarSecret;
-    delete (safeUser as any).keyEncryptionHint;
-    delete (safeUser as any).totpSecretEncrypted;
+    const { passcodeHash, encryptedStellarSecret, keyEncryptionHint, totpSecretEncrypted, ...safeUser } = user as Record<string, unknown>;
 
     res.json({
       export_timestamp: new Date().toISOString(),
